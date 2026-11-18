@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="docs/assets/banner.png" alt="Çöpcüler Kralı: Code cleanup with human approval." width="100%">
+  <img src="docs/assets/banner.jpg" alt="Çöpcüler Kralı: Code cleanup with human approval." width="100%">
 </p>
 
 # Çöpcüler Kralı (Trash King)
 
-<img src="docs/assets/avatar.png" alt="The Crowned Street Sweeper, the mascot of Çöpcüler Kralı" align="right" width="170">
+<img src="docs/assets/avatar.jpg" alt="The Crowned Street Sweeper, the mascot of Çöpcüler Kralı" align="right" width="170">
 
 Code cleanup with human approval.
 
@@ -163,3 +163,7 @@ python -m unittest discover -s tests -v
 ```
 
 Tests run only in temporary Git repositories created with `tempfile` and a temporary `COPCULER_STATE_DIR`. They run under `%TEMP%`, so OneDrive synchronization has never been tested. Situations that cannot be imitated in the environment (OneDrive, CRLF/autocrlf variations, LFS and filters, the POSIX executable bit, real terminal confirmation) are manual checks in [docs/manual-checks.md](docs/manual-checks.md) and do not count as passed until observed.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
