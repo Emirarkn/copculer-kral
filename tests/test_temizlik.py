@@ -1577,6 +1577,92 @@ class SecurityHardeningTest(Flow):
         self.assertIn("--require-git-check", message)
 
 
+class SecondHardeningTest(Flow):
+    """include.path expansion, git executable origin, terminal-safe JSON and read output."""
+
+    def test_filter_hidden_behind_include_path_is_refused(self):
+        root = self.repo({"a.py": "x = 1\n"})
+        extra = self.tmp / "extra.cfg"
+        extra.write_text("[filter \"evil\"]\n\tclean = echo pwned\n", encoding="utf-8")
+        run_git(root, "config", "include.path", str(extra))
+        ok, _, message = self.run_cli("snapshot", root)
+        self.assertFalse(ok)
+        self.assertIn("filter.evil.clean", message)
+
+    def test_harmless_include_path_is_accepted(self):
+        root = self.repo({"a.py": "x = 1\n"})
+        extra = self.tmp / "extra.cfg"
+        extra.write_text("[user]\n\tname = someone\n", encoding="utf-8")
+        run_git(root, "config", "include.path", str(extra))
+        self.assertTrue(self.run_cli("snapshot", root)[0])
+
+    def test_git_executable_inside_the_project_is_refused(self):
+        root = self.repo({"a.py": "x = 1\n"})
+        fake = root / "git.exe"
+        with mock.patch.object(temizlik, "_which_git", lambda: str(fake)):
+            with self.assertRaises(temizlik.Refusal) as caught:
+                temizlik.git_executable(root)
+        self.assertIn("inside the target project", str(caught.exception))
+        with mock.patch.object(temizlik, "_which_git", lambda: None):
+            with self.assertRaises(temizlik.Refusal):
+                temizlik.git_executable(root)
+
+    def test_git_executable_outside_the_project_is_used(self):
+        root = self.repo({"a.py": "x = 1\n"})
+        self.assertFalse(temizlik.is_inside(temizlik.git_executable(root), root))
+
+    def test_snapshot_json_escapes_bidi_characters_in_names(self):
+        root = self.repo({"ok.py": "x = 1\n"}, commit=False)
+        name = "evil‮txt.py"
+        try:
+            write(root, name, "y = 1\n")
+        except OSError as error:
+            self.skipTest(f"The file system refused the name ({error})")
+        run_git(root, "add", "-A")
+        run_git(root, "commit", "-q", "-m", "initial")
+        ok, out, message = self.run_cli("snapshot", root)
+        self.assertTrue(ok, message)
+        self.assertNotIn("‮", out)
+        self.assertIn("\\u202e", out)
+
+    def test_read_on_a_terminal_escapes_control_characters(self):
+        content = b"x = 1  # \x1b[31m\xe2\x80\xae end\n"
+        root = self.repo({"a.py": content})
+
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        out = Terminal()
+        with contextlib.redirect_stdout(out):
+            temizlik.main(["read", str(root), "a.py"])
+        self.assertNotIn("\x1b", out.getvalue())
+        self.assertNotIn("‮", out.getvalue())
+        self.assertIn("\\x1b[31m\\u202e end", out.getvalue())
+
+    def test_read_into_a_pipe_stays_byte_exact(self):
+        content = b"x = 1  # \x1b[31m\r\n"
+        root = self.repo({"a.py": content})
+
+        class Pipe:
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def isatty(self):
+                return False
+
+            def flush(self):
+                pass
+
+            def write(self, text):
+                raise AssertionError("text write on a binary pipe")
+
+        pipe = Pipe()
+        with mock.patch.object(sys, "stdout", pipe):
+            temizlik.main(["read", str(root), "a.py"])
+        self.assertEqual(pipe.buffer.getvalue(), content)
+
+
 class DocsConsistencyTest(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
 

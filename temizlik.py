@@ -11,6 +11,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -50,9 +51,23 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _which_git():
+    return shutil.which("git")
+
+
+def git_executable(root):
+    """Absolute path of the git executable, refusing one that lives inside the target project."""
+    found = _which_git()
+    if not found:
+        raise Refusal("Git was not found on PATH.")
+    if is_inside(found, root):
+        raise Refusal("The git executable resolves to a file inside the target project; refusing to run it.")
+    return found
+
+
 def git(root, *args, payload=None):
     result = subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-c", "apply.ignoreWhitespace=no", *args],
+        [git_executable(root), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-c", "apply.ignoreWhitespace=no", *args],
         cwd=root, env=ENV, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=60, check=False,
     )
@@ -108,7 +123,8 @@ def check_repo_config(root):
     System and global config are already disabled, but .git/config is under the project's control and
     `git apply` can run clean filters. Review such a repository by hand instead.
     """
-    listing = git(root, "config", "--local", "--list", "-z").decode("utf-8", "replace")
+    # No --local: that would skip include.path expansion, while `git apply` honours includes (and worktree config).
+    listing = git(root, "config", "--list", "--includes", "-z").decode("utf-8", "replace")
     keys = sorted({entry.split("\n", 1)[0] for entry in listing.split("\0") if entry})
     bad = [key for key in keys if COMMAND_CONFIG.match(key)]
     if bad:
@@ -1349,6 +1365,11 @@ def show_patch(data):
     sys.stdout.flush()
 
 
+def show_json(value):
+    """Print JSON with invisible characters (bidi marks and the like) escaped; names come from the repository."""
+    print(safe_text(json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")))
+
+
 def write_out(data):
     """Write bytes to stdout even when stdout has no binary buffer (tests)."""
     buffer = getattr(sys.stdout, "buffer", None)
@@ -1391,18 +1412,21 @@ def main(argv=None):
     if args.command in {"snapshot", "read"}:
         snapshot, files, excluded = inventory(root)
         if args.command == "snapshot":
-            print(json.dumps({"snapshot": snapshot, "files": sorted(files), "excluded": excluded_report(excluded),
-                              "excluded_count": len(excluded)}, ensure_ascii=False, indent=2))
+            show_json({"snapshot": snapshot, "files": sorted(files), "excluded": excluded_report(excluded),
+                       "excluded_count": len(excluded)})
         else:
             if args.file not in files:
                 raise Refusal("The file is not in the review scope.")
             data = read_source(root, args.file)
             if digest(data) != files[args.file]:
                 raise Refusal("The file changed after the scan.")
-            write_out(data)
+            if sys.stdout.isatty():
+                show_patch(data)  # a real terminal: escape control characters; pipes get the raw bytes
+            else:
+                write_out(data)
         return
     if args.command == "refs":
-        print(json.dumps(refs(root, args.symbol), ensure_ascii=False, indent=2))
+        show_json(refs(root, args.symbol))
         return
     if args.command == "undo":
         undo(root, args.receipt_id, args.require_git_check)
