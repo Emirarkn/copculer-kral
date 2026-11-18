@@ -34,7 +34,9 @@ Note: the `base_blob` record can be `null` under CRLF conversions (the Git cross
 
 ## 3. LFS and filters
 - [ ] A file tracked with Git LFS: it is out of scope in `snapshot` (pointer file versus content) and `apply` does not corrupt it. RESULT: not observed
-- [ ] A file with a repo-local `filter.*` (clean/smudge) defined: after `apply`, `git diff` shows no unexpected change and `undo` restores the bytes. RESULT: not observed
+- [ ] A repo with a repo-local `filter.*.clean|smudge|process` or `diff.*.textconv` defined: every command refuses with "run commands on files" and no filter command runs (by design, so there is no apply/undo to check). RESULT: not observed
+- [ ] A repo with a global (user-level) LFS or filter setup but no repo-local filter: the tool ignores global config; after `apply`, `git diff` shows no unexpected change and `undo` restores the bytes. RESULT: not observed
+- [ ] A patch whose context contains ANSI escape sequences or a right-to-left override: the confirmation screen shows them as `\x1b` / `‮` text, and your real terminal is not repainted. RESULT: not observed
 
 ## 4. File permissions
 - [ ] On POSIX, delete a file with the executable bit (`chmod +x`) using `delete_file`, then `undo`: mode `100755` is preserved. RESULT: not observed (the bit cannot be observed on Windows)

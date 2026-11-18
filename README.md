@@ -29,7 +29,7 @@ The agent follows [AGENTS.md](AGENTS.md) and the [review protocol](docs/review-p
 | `refs <project> <symbol>` | agent | Word-bounded search for a symbol: path and lines in scope, path and count in non-sensitive out-of-scope files, and unsearchable files under `not_reviewed` with a reason. |
 | `review <project> <plan> --ids ... [--diff]` | agent | Validates candidates, prints each candidate's status (`REVIEW_COMPLETE` / `REVIEW_INCOMPLETE`) and syntax result, and produces a 64-character approval digest. |
 | `apply <project> <plan> --ids ... --digest DIGEST` | **you** | Compares the digest, shows the patch, asks for `APPLY <digest>` in the terminal, and writes with a journal. |
-| `undo <project> <receipt_id>` | **you** | Restores from the verified backup in the state directory and asks for `UNDO <digest>`. |
+| `undo <project> <receipt_id> [--require-git-check]` | **you** | Restores from the verified backup in the state directory and asks for `UNDO <digest>`. With `--require-git-check` it refuses unless the pinned Git commit verifies every restored file. |
 | `recover <project> <receipt_id> --forward \| --backward` | **you** | Finishes an interrupted write (`--forward`) or reverts the files that were already written (`--backward`). Asks for `RECOVER <digest>`. |
 
 `apply`, `undo` and `recover` only run in an interactive terminal. The agent never runs them.
@@ -119,7 +119,9 @@ Trust model:
 
 - The review process (the agent) has read-only access to the target project and its `.git` directory. It does not touch the state directory. `apply`, `undo` and `recover` run only in your terminal.
 - In the agent environment, deny: the `apply`, `undo` and `recover` commands, writes to the state directory, and writes to the target's `.git` directory. In Codex or Claude Code permission settings define these command patterns and paths as `deny`, and allow only `snapshot`, `read`, `refs`, `review`.
-- The `isatty` check is only an interaction check; it does not stop an agent. If the agent can write to the state directory or to `.git`, the reliable-undo guarantee is void.
+- The confirmation prompt (`APPLY|UNDO|RECOVER <digest>`) is a human-in-the-loop gate, not a security boundary. The `isatty` check is only an interaction check; an agent that can allocate a pseudo-terminal could read and type the line. The real barrier is the permission setup above: deny the agent those commands.
+- Repositories whose local `.git/config` defines settings that run commands on files (`filter.*.clean|smudge|process`, `diff.*.textconv|command`, `diff.external`) are refused by every command, because `git apply` could run them. System and global Git config is always ignored. Review such repositories by hand.
+- The patch shown for confirmation is display-sanitized: control characters, bidirectional and other invisible Unicode characters are shown as escapes (`\x1b`, `‮`), so a file cannot repaint the terminal to hide what is being deleted. The digest and the written patch use the real bytes. `read` prints raw file content; run it only in a terminal you trust. If the agent can write to the state directory or to `.git`, the reliable-undo guarantee is void.
 - The state directory holds source-content backups. Keep it away from hosted agents and manage its retention yourself.
 
 ## Where undo gets its trust
@@ -127,7 +129,7 @@ Trust model:
 - **The primary source of trust** is the `before/*.bin` backup in the state directory. Its hash is in `receipt.json`, and the hash of `receipt.json` is in `index.jsonl`. `undo` verifies them. It does not use any `patch` field in the receipt; the patch is regenerated from the backup every time.
 - **The second cross-check** is the pinned `base_commit`: the file's blob in that commit and its content must match the backup byte for byte. If the commit is no longer reachable (gc, reset) the check is reported as "not possible" and only the backup is used. Files with uncommitted changes have no blob record.
 - If you changed a file after applying, `undo` refuses and lists the files.
-- Someone who can write to the state directory can change both the backup and the digests consistently. The Git cross-check catches that, but not if they can also write to `.git`.
+- Someone who can write to the state directory can change both the backup and the digests consistently. The Git cross-check catches that, but not if they can also write to `.git`. The cross-check is also **skipped** (and reported as "not possible") when the receipt has no `base_commit`, the commit is unreachable, or a file had no recorded blob, and a person who can rewrite the receipt can force that skip. Use `undo --require-git-check` when you want the skip to be a refusal instead.
 - The lock is best-effort: while an interrupted receipt exists, a new `apply`/`undo` is refused, but a race between two concurrent processes is not prevented. Stop other processes that modify the same working tree while you apply or undo.
 
 ## Journal states

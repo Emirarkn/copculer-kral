@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import tokenize
+import unicodedata
 
 
 SOURCE = set(".c .cc .cpp .cs .css .go .h .hpp .html .java .js .jsx .kt .md .mjs .cjs .php .py .rb .rs .scss .sh .sql .svelte .ts .tsx .vue .ps1".split())
@@ -98,10 +99,29 @@ def reject_inside_project(root, path, what):
         raise Refusal(f"{what} cannot be inside the target project.")
 
 
+COMMAND_CONFIG = re.compile(r"^(filter\..+\.(clean|smudge|process)|diff\..+\.(textconv|command)|diff\.external)$", re.I)
+
+
+def check_repo_config(root):
+    """Refuse repositories whose local config makes Git run commands on files (filter drivers, textconv).
+
+    System and global config are already disabled, but .git/config is under the project's control and
+    `git apply` can run clean filters. Review such a repository by hand instead.
+    """
+    listing = git(root, "config", "--local", "--list", "-z").decode("utf-8", "replace")
+    keys = sorted({entry.split("\n", 1)[0] for entry in listing.split("\0") if entry})
+    bad = [key for key in keys if COMMAND_CONFIG.match(key)]
+    if bad:
+        raise Refusal("The repository-local Git config defines settings that run commands on files ("
+                      + ", ".join(bad) + "). Remove them or review this repository by hand; "
+                      "the tool will not run commands configured by a repository.")
+
+
 def project(value):
     root = Path(value).resolve(strict=True)
     if not root.is_dir() or Path(git(root, "rev-parse", "--show-toplevel").decode("utf-8").rstrip("\r\n")).resolve() != root:
         raise Refusal("Provide the root directory of a Git project.")
+    check_repo_config(root)
     return root
 
 
@@ -1066,7 +1086,7 @@ def commit_changes(root, ops, label, journal, *, expected=None, extra=None, mode
     for name, result in prepared["report"]:
         print(f"Syntax | {name} | {result}")
     print("Patch:")
-    write_out(prepared["patch"])
+    show_patch(prepared["patch"])
     approval = prepared["approval"]
     print(f"Approval digest {approval}")
     if expected is not None and expected != approval:
@@ -1188,26 +1208,37 @@ def load_backups(receipt, directory):
 
 
 def check_base_blobs(root, receipt, items):
-    """Second cross-check against the pinned commit. The state-dir backup stays the source of truth."""
+    """Second cross-check against the pinned commit. The state-dir backup stays the source of truth.
+
+    Returns True only when every file was verified against the commit. The check is skipped (False) when the
+    receipt has no base_commit, the commit is unreachable, or a file has no recorded blob. Anyone who can
+    rewrite the receipt can also force the skip, so use `undo --require-git-check` when that matters.
+    """
     base = receipt.get("base_commit")
     if not base:
         print("Git cross-check: not possible (no base_commit in the receipt). Using the backup only.")
-        return
+        return False
     try:
         git(root, "cat-file", "-e", f"{base}^{{commit}}")
     except Refusal:
         print("Git cross-check: not possible (commit unreachable). Using the backup only.")
-        return
+        return False
+    complete = True
     for item in items:
         if not item["base_blob"]:
+            complete = False
             continue
         found = git(root, "rev-parse", f"{base}:{item['name']}").decode("ascii").strip()
         if found != item["base_blob"] or git(root, "cat-file", "blob", found) != item["before"]:
             raise Refusal(f"Git cross-check mismatch: {item['name']}")
-    print("Git cross-check: OK.")
+    if complete:
+        print("Git cross-check: OK.")
+    else:
+        print("Git cross-check: OK for files with a recorded blob; some files had none (uncommitted changes).")
+    return complete
 
 
-def undo(root, receipt_id):
+def undo(root, receipt_id, require_git_check=False):
     prepare_state(root)
     ensure_unlocked(root)
     receipt, directory = load_receipt(root, receipt_id)
@@ -1218,7 +1249,9 @@ def undo(root, receipt_id):
             or (journal.direction == "undo" and journal.status == "reverted")):
         raise Refusal("This receipt cannot be undone (already undone, or never applied).")
     items = load_backups(receipt, directory)
-    check_base_blobs(root, receipt, items)
+    verified_by_git = check_base_blobs(root, receipt, items)
+    if require_git_check and not verified_by_git:
+        raise Refusal("--require-git-check: the Git cross-check could not verify every file, so undo was refused.")
     ops, changed = [], []
     for item in items:
         current = current_bytes(root, item["name"])
@@ -1290,6 +1323,32 @@ def show(plan):
         print("Note | " + note)
 
 
+def safe_text(data):
+    """Display-safe text for a patch: control, format (bidi) and other invisible characters are shown escaped.
+
+    Only the display changes; the approval digest and the written patch use the real bytes.
+    """
+    text = data.decode("utf-8", "replace").replace("\r\n", "\n")
+    out = []
+    for char in text:
+        if char in "\n\t" or unicodedata.category(char) not in {"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"}:
+            out.append(char)
+        else:
+            code = ord(char)
+            if code < 0x100:
+                out.append("\\x%02x" % code)
+            elif code < 0x10000:
+                out.append("\\u%04x" % code)
+            else:
+                out.append("\\U%08x" % code)
+    return "".join(out)
+
+
+def show_patch(data):
+    sys.stdout.write(safe_text(data))
+    sys.stdout.flush()
+
+
 def write_out(data):
     """Write bytes to stdout even when stdout has no binary buffer (tests)."""
     buffer = getattr(sys.stdout, "buffer", None)
@@ -1320,6 +1379,9 @@ def main(argv=None):
             command.add_argument("--digest", required=True)
         if name in {"undo", "recover"}:
             command.add_argument("receipt_id")
+        if name == "undo":
+            command.add_argument("--require-git-check", action="store_true",
+                                 help="refuse unless the pinned Git commit verifies every restored file")
         if name == "recover":
             group = command.add_mutually_exclusive_group(required=True)
             group.add_argument("--forward", action="store_true")
@@ -1343,7 +1405,7 @@ def main(argv=None):
         print(json.dumps(refs(root, args.symbol), ensure_ascii=False, indent=2))
         return
     if args.command == "undo":
-        undo(root, args.receipt_id)
+        undo(root, args.receipt_id, args.require_git_check)
         return
     if args.command == "recover":
         recover(root, args.receipt_id, "forward" if args.forward else "backward")
@@ -1357,7 +1419,7 @@ def main(argv=None):
             print(f"Syntax | {name} | {result}")
         print(f"Approval digest {prepared['approval']}")
         if args.diff:
-            write_out(prepared["patch"])
+            show_patch(prepared["patch"])
         print(LIMITS_TEXT)
         return
     incomplete = [key for key, value in plan["status"].items() if value.startswith("REVIEW_INCOMPLETE")]

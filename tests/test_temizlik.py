@@ -1474,6 +1474,109 @@ class ModuleAwareTest(Flow):
         self.assertIn("REVIEW_INCOMPLETE", self.status_line(out))
 
 
+class SecurityHardeningTest(Flow):
+    """Repository-local command config, terminal-safe patch display, strict Git cross-check."""
+
+    def test_filter_driver_in_repo_config_is_refused(self):
+        for key in ("filter.evil.clean", "filter.evil.smudge", "filter.evil.process", "diff.evil.textconv",
+                    "diff.evil.command", "diff.external"):
+            with self.subTest(key=key):
+                sub = self.tmp / key
+                sub.mkdir()
+                root = make_repo(sub, {"a.py": "x = 1\n"})
+                run_git(root, "config", key, "echo pwned")
+                for command in (["snapshot", root], ["refs", root, "xyz"]):
+                    ok, _, message = self.run_cli(*command)
+                    self.assertFalse(ok)
+                    self.assertIn("run commands on files", message)
+                    self.assertIn(key, message)
+
+    def test_filter_driver_never_runs(self):
+        root = self.repo({"a.py": "x = 1\nkeep = 2\n"})
+        marker = self.tmp / "ran.txt"
+        run_git(root, "config", "filter.evil.clean", f"python -c \"open(r'{marker}', 'w').write('x')\"")
+        write(root, ".gitattributes", "*.py filter=evil\n")
+        ok, _, _ = self.run_cli("snapshot", root)
+        self.assertFalse(ok)
+        self.assertFalse(marker.exists())
+
+    def test_ordinary_local_config_is_accepted(self):
+        root = self.repo({"a.py": "x = 1\n"})
+        run_git(root, "config", "user.name", "someone")
+        run_git(root, "config", "core.autocrlf", "false")
+        run_git(root, "config", "alias.st", "status")
+        self.assertTrue(self.run_cli("snapshot", root)[0])
+
+    def test_safe_text_escapes_invisible_characters(self):
+        shown = temizlik.safe_text(b"a\x1b[2Jb\xe2\x80\xaec\x00d\rE\tF\n")
+        self.assertEqual(shown, "a\\x1b[2Jb\\u202ec\\x00d\\x0dE\tF\n")
+        self.assertEqual(temizlik.safe_text(b"one\r\ntwo\r\n"), "one\ntwo\n")
+        self.assertEqual(temizlik.safe_text("café çö".encode()), "café çö")
+
+    def test_review_diff_never_prints_terminal_escapes(self):
+        content = b"a = 1\n# \x1b[2J\xe2\x80\xae hidden\nb = 2\nkeep = 3\n"
+        root = self.repo({"a.py": content})
+        candidate = {"id": "C1", "path": "a.py", "action": "remove_lines", "lines": [[3, 3]], "symbols": ["b"]}
+        plan = self.make_plan(root, [candidate])
+        ok, out, message = self.run_cli("review", root, plan, "--ids", "C1", "--diff")
+        self.assertTrue(ok, message)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("‮", out)
+        self.assertIn("\\x1b[2J\\u202e hidden", out)
+
+    def test_display_escaping_does_not_change_the_approval_digest(self):
+        content = b"a = 1\n# \x1b[2J\xe2\x80\xae hidden\nb = 2\nkeep = 3\n"
+        root = self.repo({"a.py": content})
+        candidate = {"id": "C1", "path": "a.py", "action": "remove_lines", "lines": [[3, 3]], "symbols": ["b"]}
+        plan = self.make_plan(root, [candidate])
+        first = self.review(root, plan, "C1")
+        with mock.patch.object(temizlik, "safe_text", lambda data: data.decode("utf-8", "replace")):
+            second = self.review(root, plan, "C1")
+        self.assertEqual(first, second)
+
+    FILES = {"src/a.py": "l1\nl2\nl3\nl4\n", "keep.py": "z = 1\n"}
+    PLAN = [{"id": "C1", "path": "src/a.py", "action": "remove_lines", "lines": [[2, 3]]}]
+
+    def applied(self, files=None):
+        root = self.repo(files or self.FILES)
+        plan = self.make_plan(root, self.PLAN)
+        return root, self.apply_ok(root, plan, "C1")
+
+    def test_require_git_check_passes_when_every_file_is_verified(self):
+        root, receipt = self.applied()
+        ok, out, message = self.run_cli("undo", root, receipt, "--require-git-check")
+        self.assertTrue(ok, message)
+        self.assertEqual(read(root, "src/a.py"), b"l1\nl2\nl3\nl4\n")
+
+    def test_require_git_check_refuses_when_receipt_drops_the_commit(self):
+        root, receipt = self.applied()
+        self.rewrite_receipt(receipt, lambda data: data.update(base_commit=None))
+        ok, out, message = self.run_cli("undo", root, receipt, "--require-git-check")
+        self.assertFalse(ok)
+        self.assertIn("--require-git-check", message)
+        self.assertEqual(read(root, "src/a.py"), b"l1\nl4\n")
+        # Without the flag the skip is allowed and reported, as documented.
+        ok, out, message = self.run_cli("undo", root, receipt)
+        self.assertTrue(ok, message)
+        self.assertIn("not possible", out)
+
+    def test_require_git_check_refuses_when_a_blob_is_missing(self):
+        root = self.repo(self.FILES)
+        write(root, "src/a.py", "l1\nl2\nl3\nl4\nlocal\n")  # uncommitted: no base_blob recorded
+        plan = self.make_plan(root, self.PLAN)
+        receipt = self.apply_ok(root, plan, "C1")
+        ok, _, message = self.run_cli("undo", root, receipt, "--require-git-check")
+        self.assertFalse(ok)
+        self.assertIn("could not verify every file", message)
+
+    def test_require_git_check_refuses_when_commit_is_unreachable(self):
+        root, receipt = self.applied()
+        self.rewrite_receipt(receipt, lambda data: data.update(base_commit="0" * 40))
+        ok, _, message = self.run_cli("undo", root, receipt, "--require-git-check")
+        self.assertFalse(ok)
+        self.assertIn("--require-git-check", message)
+
+
 class DocsConsistencyTest(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
 
